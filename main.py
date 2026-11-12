@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Forecast the top 5 new Solana coins by market cap at the house's answer reads.
 
-Model (v2; everything about the window is read from task.json at runtime, every
+Model (v3; everything about the window is read from task.json at runtime, every
 data-driven quantity is estimated from the history at run time):
 
   * The leaderboard is a race in log10(market cap in SOL).  Every coin that
@@ -16,7 +16,7 @@ data-driven quantity is estimated from the history at run time):
     the horizon, not one fixed prior curve.
   * A curve coin graduates with a per-mark hazard that grows with its
     distance to the completion level, and lands either at the breakout level
-    or at a dead level, as the history shows.
+    or at a dead one, as the history shows.
   * Coins born after the cut are an inhomogeneous Poisson process of
     breakouts: a rate per minute measured from the marks' graduated counters
     and the observed crossings of the contention level, times the
@@ -25,8 +25,10 @@ data-driven quantity is estimated from the history at run time):
   * The place distributions are the order statistics of that race, computed
     once per answer read and averaged over the reads (the arithmetic mean
     maximises the mean of the log scores).  The per-place size bins are the
-    race's own bins blended with the measured per-place size distribution:
-    its level growth and its gaps to the leader.
+    race's own bins and nothing else: the same order statistics that produce
+    the order probabilities also produce the size distribution of the coin
+    that takes each place, so the two halves of the answer stay consistent
+    with each other and with one single model of the race.
 """
 
 import json
@@ -79,18 +81,6 @@ FADE_BETA = 0.60         # the cumulative hazard grows sub-linearly in marks
 FADE_LO, FADE_HI = 0.12, 0.34
 STALE_W = 0.40           # discount for a coin missing from the last mark
 LOW_POOL_W = 0.35        # discount for a pool coin already below the leaders
-
-# --- size calibration ---
-W_EMP = 0.50             # weight of the measured per-place size distribution
-ANCHOR_W = 0.50          # weight of the measured level vs the race's own mean
-LEVEL_PRIOR = 0.13       # per-10-minute growth of the place-1 cap
-LEVEL_PRIOR_W = 1.0      # weight of that prior, in transitions
-LEVEL_LO, LEVEL_HI = 0.04, 0.22
-LEVEL_TAU = 90.0         # minutes: the level growth saturates over this scale
-LEVEL_CAP = 0.38         # cap on the cumulative level growth
-GAP_PRIOR = (0.0, 0.18, 0.19, 0.23, 0.27)   # place1 - place k, believed prior
-EMP_SD_PRIOR = (0.10, 0.08, 0.08, 0.09, 0.10)
-EMP_SD_FLOOR = 0.07      # tightest per-place size spread we will believe
 
 SOL_LAMPORTS = 1_000_000_000.0
 
@@ -234,13 +224,12 @@ def transitions(marks):
 
 
 def estimate_params(marks):
-    """Leader growth and spread, fade rate, level growth, breakout rate/size."""
+    """Leader growth and spread, fade rate, breakout rate/size."""
     trs = transitions(marks)
     t_last = parse_ts(marks[-1]["at"]) if marks else None
 
     # --- leader growth: the coins that held a top-5 place across a transition
     lead = []       # (delta per 10min, recency weight)
-    level = []      # place-1 cap growth per 10 min
     persist = []    # (kept, total) of the previous mark's top 5, pool era only
     for t_cur, span, prev_rows, cur_rows in trs:
         age = 0.0 if t_last is None else max(0.0, (t_last - t_cur).total_seconds() / 600.0)
@@ -260,9 +249,6 @@ def estimate_params(marks):
             mint = row["mint"]
             if mint in clog and any(r["mint"] == mint for r in cur_rows[:5]):
                 lead.append(((clog[mint] - plog[mint]) * (10.0 / span), w))
-        if prev_rows and cur_rows:
-            level.append(((clog[cur_rows[0]["mint"]] - plog[prev_rows[0]["mint"]])
-                          * (10.0 / span), w))
 
         def pool_era(rows):
             if len(rows) < 5:
@@ -290,11 +276,6 @@ def estimate_params(marks):
         mu, sd = 0.07, 0.09
     mu = max(0.0, min(0.15, mu))
     sd = max(0.05, min(0.30, sd))
-
-    lvl_m = wmean(level, LEVEL_PRIOR)
-    lvl_sw = sum(w for _, w in level)
-    lvl = (lvl_m * lvl_sw + LEVEL_PRIOR * LEVEL_PRIOR_W) / (lvl_sw + LEVEL_PRIOR_W)
-    lvl = max(LEVEL_LO, min(LEVEL_HI, lvl))
 
     if persist:
         sw = sum(w for _, _, w in persist)
@@ -393,46 +374,9 @@ def estimate_params(marks):
         bmean, bsd = BREAK_PRIOR
     bsd = max(0.10, min(0.30, bsd))
 
-    # --- per-place size structure of the pool era (for the size calibration)
-    # only marks whose whole top 5 has graduated describe the sizes that
-    # matter; earlier marks still have curve coins in the lower places
-    era = []
-    for mark in marks[-3:]:
-        rows = mark.get("rows") or []
-        if len(rows) < 5:
-            continue
-        caps = []
-        ok = True
-        for row in rows[:5]:
-            c = float(row["market_cap_lamports"]) / SOL_LAMPORTS
-            if c <= 0:
-                ok = False
-                break
-            lg = math.log10(c)
-            if row.get("venue") != "pool" and lg < BREAK_LOG:
-                ok = False
-                break
-            caps.append(lg)
-        if ok:
-            era.append(caps)
-    if era:
-        gaps = []
-        sds = []
-        for k in range(5):
-            gs = [caps[0] - caps[k] for caps in era]
-            gaps.append(max(0.0, sum(gs) / len(gs)))
-            if len(era) >= 2:
-                m = sum(caps[k] for caps in era) / len(era)
-                sds.append(math.sqrt(sum((caps[k] - m) ** 2 for caps in era) / len(era)))
-            else:
-                sds.append(EMP_SD_PRIOR[k])
-    else:
-        gaps = list(GAP_PRIOR)
-        sds = list(EMP_SD_PRIOR)
-
     return {
         "mu": mu, "sd": sd, "rate": rate, "bmean": bmean, "bsd": bsd,
-        "fade": fade, "level": lvl, "gaps": gaps, "emp_sd": sds,
+        "fade": fade,
     }
 
 
@@ -443,12 +387,6 @@ def mom_drift(coin, params, horizon):
     """Saturating cumulative growth from the coin's own momentum."""
     h = max(0.0, horizon)
     return coin.slope * (h / 10.0) * sat_scale(h, MOM_TAU)
-
-
-def level_growth(params, horizon):
-    """Saturating cumulative growth of the place-1 cap level."""
-    h = max(0.0, horizon)
-    return min(LEVEL_CAP, params["level"] * (h / 10.0) * sat_scale(h, LEVEL_TAU))
 
 
 def coin_components(coin, params, horizon, cadence):
@@ -679,23 +617,6 @@ def race(named, params, horizon, places, chart_size, cadence, edges):
 # --------------------------------------------------------------------------
 # forecast assembly
 # --------------------------------------------------------------------------
-def emp_size_bins(params, anchor, places, edges):
-    """Measured per-place size distribution: gaps around the anchor level."""
-    nbins = len(edges) + 1
-    out = []
-    for k in range(places):
-        mean = anchor - params["gaps"][k]
-        sd = max(EMP_SD_FLOOR, params["emp_sd"][k])
-        row = []
-        for b in range(nbins):
-            lo = edges[b - 1] if b >= 1 else -1e9
-            hi = edges[b] if b < nbins - 1 else 1e9
-            p = norm_cdf((hi - mean) / sd) - norm_cdf((lo - mean) / sd)
-            row.append(max(0.0, p))
-        out.append(row)
-    return out
-
-
 def build_forecast(task, marks):
     places = int(task.get("places", 5))
     chart_size = int(task.get("chart_size", 100))
@@ -713,31 +634,9 @@ def build_forecast(task, marks):
     cand = sorted(coins.values(), key=lambda c: (-c.log, c.rank, c.mint))
     cand = [c for c in cand if c.log >= 1.9 or c.venue == "pool"][:400]
 
-    # anchor of the measured size distribution: the last mark's leader cap,
-    # when the pool era has begun; otherwise the race's own place-1 mean
-    last_rows = marks[-1].get("rows") or [] if marks else []
-    anchor_emp = None
-    if len(last_rows) >= 5:
-        cap1 = float(last_rows[0]["market_cap_lamports"]) / SOL_LAMPORTS
-        if cap1 > 0:
-            lg1 = math.log10(cap1)
-            if last_rows[0].get("venue") == "pool" or lg1 >= BREAK_LOG:
-                anchor_emp = lg1
-
-    # log-cap centre of every size bin (for reading a distribution's level)
-    centers = []
-    for b in range(nbins):
-        if b == 0:
-            centers.append(edges[0] - 0.05)
-        elif b == nbins - 1:
-            centers.append(edges[-1] + 0.05)
-        else:
-            centers.append((edges[b - 1] + edges[b]) / 2.0)
-
     acc_coin = [dict() for _ in range(places)]
     acc_new = [0.0] * places
     acc_bins = [[0.0] * nbins for _ in range(places)]
-    acc_emp = [[0.0] * nbins for _ in range(places)]
     nreads = 0
     for r in reads:
         horizon = (r - last_at).total_seconds() / 60.0
@@ -751,20 +650,6 @@ def build_forecast(task, marks):
             acc_new[k] += pn[k]
             for b, v in enumerate(pb[k]):
                 acc_bins[k][b] += v
-        # anchor of the measured distribution: the last mark's leader cap
-        # grown at the measured level, blended with the race's own place-1
-        # mean (the race knows about newcomers the anchor does not)
-        tot = sum(pb[0])
-        model_p1 = (sum(c * pb[0][b] for b, c in enumerate(centers)) / tot) if tot > 0 else 0.0
-        if anchor_emp is not None:
-            anchor = (ANCHOR_W * (anchor_emp + level_growth(params, horizon)) +
-                      (1.0 - ANCHOR_W) * model_p1)
-        else:
-            anchor = model_p1
-        emp = emp_size_bins(params, anchor, places, edges)
-        for k in range(places):
-            for b, v in enumerate(emp[k]):
-                acc_emp[k][b] += v
     inv = 1.0 / max(1, nreads)
     for k in range(places):
         for m in list(acc_coin[k].keys()):
@@ -778,11 +663,10 @@ def build_forecast(task, marks):
         for mint, p in rows:
             probabilities.append({"mint": mint, "place": k + 1, "p": round(p, 9)})
 
-    # ---- sizes: the race's bins blended with the measured distribution ----
+    # ---- sizes: the race's own per-place bins, nothing blended in ----
     sizes = []
     for k in range(places):
-        bins = [(1.0 - W_EMP) * acc_bins[k][b] * inv +
-                W_EMP * acc_emp[k][b] * inv for b in range(nbins)]
+        bins = [v * inv for v in acc_bins[k]]
         tot = sum(bins)
         if tot > 1.0:
             bins = [b / tot for b in bins]

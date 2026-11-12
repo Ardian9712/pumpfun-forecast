@@ -8,7 +8,7 @@ Solana pump.fun coins by market cap at the house's answer reads.
   (else `/input`), writes `$MAKEFUN_OUTPUT_DIR/forecast.json` (else
   `/output/forecast.json`).
 
-## Model (v2)
+## Model (v3)
 
 The leaderboard is a race in log10(market cap in SOL). Every coin that counts
 is a dud (pinned near its launch cap), a curve coin still climbing its bonding
@@ -27,9 +27,17 @@ curve, or a graduated pool coin; pool coins hold essentially every top place.
   of the log size a breakout coin reaches at a given age. That mass is left
   unnamed on purpose, exactly as the rules reward.
 * The place distributions are the order statistics of the race, computed per
-  answer read and averaged over the reads. The per-place size bins are the
-  race's own bins blended with the measured per-place size distribution: its
-  level growth and its gaps to the leader.
+  answer read and averaged over the reads. **The per-place size bins are those
+  same order statistics and nothing else**: the race that says who takes each
+  place also says how big that coin is, so the order half and the size half of
+  the answer come from one single model instead of two fitted separately.
+
+v3 keeps v2's order engine unchanged (per-coin momentum, distance-driven
+graduation hazard, measured fade, newcomer breakout rate, contention level
+3.00) and drops v2's second, separately-fitted size distribution, which was
+blended 50/50 into the race's bins. That blend was estimated from the last
+three marks only, behind an "is this the pool era yet" heuristic, and it made
+the size answer depend on quantities the order model never sees.
 
 Everything about the window (deadline, reads, places, size edges, chart size)
 is read from task.json at runtime; every other quantity is estimated from the
@@ -44,4 +52,16 @@ history at runtime.
   later ones, against the do-nothing and house baselines.
 
 Backtest mean log score: v1 -32.016 (order -18.748, sizes -13.268),
-v2 -26.875 (order -16.787, sizes -10.088), house baseline -37.768.
+v2 -26.875 (order -16.787, sizes -10.088),
+v3 -27.003 (order -16.787, sizes -10.215), house baseline -37.768.
+
+Read those three numbers honestly: **v3 beats v1 at every cut but does not
+beat v2's mean** -- it is 0.128 worse, all of it in the sizes. The local
+backtest is only 3 cuts and 6 answer reads, and v2 already taught us that a
+backtest gain there did not carry into the practice window, so a 0.5% mean
+difference is not evidence either way. What v3 buys is one model instead of
+two, with no per-place calibration fitted on three marks. An extra variant
+was tried and rejected: shrinking the race's bins toward the place-pooled
+marginal made things worse at every weight (w=0.10 ... 0.40, mean -27.09 to
+-27.48), because the per-place level gaps are real signal and pooling them
+away destroys it.
