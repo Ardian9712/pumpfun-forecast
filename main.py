@@ -1,27 +1,32 @@
 #!/usr/bin/env python3
 """Forecast the top 5 new Solana coins by market cap at the house's answer reads.
 
-Model (derived from the practice history, nothing copied from any starter):
+Model (v2; everything about the window is read from task.json at runtime, every
+data-driven quantity is estimated from the history at run time):
 
   * The leaderboard is a race in log10(market cap in SOL).  Every coin that
-    counts is either a "dud" (pinned near its launch cap ~28 SOL, log ~1.45),
-    a "curve" coin still climbing its bonding curve, or a "pool" coin that has
-    graduated.  Graduated pool coins hold essentially every top place, so a
+    counts is a "dud" (pinned near its launch cap ~28 SOL, log ~1.45), a
+    "curve" coin still climbing its bonding curve, or a "pool" coin that has
+    graduated.  Graduated pool coins hold essentially every top places, so a
     coin's venue and its current log size are the two facts that matter.
-  * Each named coin's log size a horizon h out is a 3-component mixture:
-    keep growing (a saturating drift + diffusion), fall back to its dud level
-    (the market's attention moves on), or - if it is still on its curve - jump
-    to the breakout level when it graduates.
-  * Coins born after the cut are modelled as an inhomogeneous Poisson process
-    of breakouts: a rate per minute (measured from the history) times the
-    distribution of the log size a breakout coin reaches at a given age.  This
-    mass is left unnamed on purpose, exactly as the rules reward.
-  * The place distributions and the per-place size-bin distributions are the
-    order statistics of that race, computed once per answer read and averaged
-    over the reads (the arithmetic mean maximises the mean of the log scores).
-
-Everything about the window (deadline, reads, places, size edges, chart size)
-is read from task.json at runtime.
+  * Each named coin's log size a horizon h out is a mixture of: keep growing,
+    fade out of the race, or - if it is still on its curve - jump when it
+    graduates.  A leader's growth is its own recent momentum (recency
+    weighted, shrunk toward the population's leader growth), saturating with
+    the horizon, not one fixed prior curve.
+  * A curve coin graduates with a per-mark hazard that grows with its
+    distance to the completion level, and lands either at the breakout level
+    or at a dead level, as the history shows.
+  * Coins born after the cut are an inhomogeneous Poisson process of
+    breakouts: a rate per minute measured from the marks' graduated counters
+    and the observed crossings of the contention level, times the
+    distribution of the log size a breakout coin reaches at a given age.
+    This mass is left unnamed on purpose, exactly as the rules reward.
+  * The place distributions are the order statistics of that race, computed
+    once per answer read and averaged over the reads (the arithmetic mean
+    maximises the mean of the log scores).  The per-place size bins are the
+    race's own bins blended with the measured per-place size distribution:
+    its level growth and its gaps to the leader.
 """
 
 import json
@@ -36,18 +41,56 @@ from datetime import datetime, timezone
 DUD_LOG = 1.45           # log10(SOL) a coin with no traction sits at
 DUD_SD = 0.06
 LEADER_LOG = 2.50        # log10(SOL) at which a coin has clearly broken out
-BREAK_LOG = 2.80         # log10(SOL) a "breakout" coin is first seen at
-GROW_TOTAL = 0.40        # extra log10 a broken-out coin gains in the long run
-GROW_TAU = 240.0         # minutes: time constant of that growth
-SIGMA_MAX = 0.45         # cap on the log-size spread at long horizons
-DEATH_LAMBDA = 0.11      # leader disappearance rate per 10-minute mark
-DEATH_BETA = 0.60        # the cumulative hazard grows sub-linearly in marks
-CURVE_JUMP_P = 0.30      # chance a curve coin near the top graduates upward
+BREAK_LOG = 3.00         # log10(SOL) a coin must reach to contend for the top 5
+FADE_DROP = 0.25         # log a leader loses when it fades out of the race
+FADE_SD = 0.16
+FADE_DUD = 0.30          # share of fades that go all the way down to the dud
+GRAD_LO = 2.00           # curve completion ramp: hazard 0 here ...
+GRAD_HI = 2.32           # ... and saturated from here
+GRAD_P_MAX = 0.92        # per-mark graduation hazard at/above GRAD_HI
+GRAD_HIT = 2.78          # pool entry level of a graduation that matters
+GRAD_HIT_SD = 0.16
+GRAD_MISS = 1.65         # pool entry level of a graduation that dies
+SIGMA_MAX = 0.40         # cap on the log-size spread at long horizons
 MIN_ROW_P = 0.0004       # do not bother naming a coin below this
 X_LO, X_HI, X_STEP = 1.00, 6.40, 0.02
 AGE_STEP = 5.0           # minutes, newcomer age grid (fine near launch)
 AGE_STEP_FAR = 15.0
 AGE_FAR_FROM = 120.0
+
+# --- momentum (per-coin recent growth) ---
+MOM_TAU = 120.0          # minutes: momentum saturates over this scale
+MOM_K = 3.0              # shrinkage of a coin's own slope toward the population
+MOM_CAP = 0.16           # cap on the slope used for the drift (log/10min)
+MOM_FLOOR = -0.03
+MOM_DECAY = 0.55         # recency decay of a coin's sightings (per 10 min)
+
+# --- newcomer rate ---
+RATE_PRIOR = 0.34        # per-minute breakout rate believed on weak evidence
+RATE_PRIOR_W = 3.0       # weight of that prior, in 10-minute bins
+RATE_LO, RATE_HI = 0.08, 0.70
+BREAK_PRIOR = (3.10, 0.18)   # (mean, sd) of a breakout's log size
+BREAK_K = 3.0            # shrinkage of the measured breakout size
+
+# --- fade (leaving the race) ---
+FADE_PRIOR = 0.18        # per-mark fade probability believed on weak evidence
+FADE_PRIOR_W = 1.0
+FADE_BETA = 0.60         # the cumulative hazard grows sub-linearly in marks
+FADE_LO, FADE_HI = 0.12, 0.34
+STALE_W = 0.40           # discount for a coin missing from the last mark
+LOW_POOL_W = 0.35        # discount for a pool coin already below the leaders
+
+# --- size calibration ---
+W_EMP = 0.50             # weight of the measured per-place size distribution
+ANCHOR_W = 0.50          # weight of the measured level vs the race's own mean
+LEVEL_PRIOR = 0.13       # per-10-minute growth of the place-1 cap
+LEVEL_PRIOR_W = 1.0      # weight of that prior, in transitions
+LEVEL_LO, LEVEL_HI = 0.04, 0.22
+LEVEL_TAU = 90.0         # minutes: the level growth saturates over this scale
+LEVEL_CAP = 0.38         # cap on the cumulative level growth
+GAP_PRIOR = (0.0, 0.18, 0.19, 0.23, 0.27)   # place1 - place k, believed prior
+EMP_SD_PRIOR = (0.10, 0.08, 0.08, 0.09, 0.10)
+EMP_SD_FLOOR = 0.07      # tightest per-place size spread we will believe
 
 SOL_LAMPORTS = 1_000_000_000.0
 
@@ -82,13 +125,37 @@ def read_ndjson(path):
     return out
 
 
+def wmean(pairs, default):
+    """Weighted mean of (value, weight); falls back to default."""
+    sw = sum(w for _, w in pairs)
+    if sw <= 0.0:
+        return default
+    return sum(v * w for v, w in pairs) / sw
+
+
+def wvar(pairs, mean):
+    sw = sum(w for _, w in pairs)
+    if sw <= 0.0:
+        return 0.0
+    return sum(w * (v - mean) ** 2 for v, w in pairs) / sw
+
+
+def sat_scale(h, tau):
+    """Mean-reverting cumulative factor: 1 at short h, -> tau/10 as h grows."""
+    h = max(0.0, h)
+    if h <= 0.0 or tau <= 0.0:
+        return 0.0
+    return (1.0 - math.exp(-h / tau)) / (h / tau)
+
+
 # --------------------------------------------------------------------------
 # history -> per-coin state
 # --------------------------------------------------------------------------
 class Coin(object):
-    __slots__ = ("mint", "log", "age", "venue", "rank", "last_mark", "stale")
+    __slots__ = ("mint", "log", "age", "venue", "rank", "last_mark", "stale",
+                 "slope")
 
-    def __init__(self, mint, log, age, venue, rank, last_mark, stale):
+    def __init__(self, mint, log, age, venue, rank, last_mark, stale, slope):
         self.mint = mint
         self.log = log
         self.age = age
@@ -96,168 +163,339 @@ class Coin(object):
         self.rank = rank
         self.last_mark = last_mark
         self.stale = stale
+        self.slope = slope
 
 
-def build_coins(marks):
-    """Latest known state of every coin the history names."""
-    coins = {}
+def coin_slope(hist, mu_pop):
+    """Recency-weighted log-growth rate (log/10min) of one coin.
+
+    hist is the coin's sightings as (t_minutes, log) pairs.  The fitted slope
+    is shrunk toward the population's leader growth, so a coin seen twice is
+    not trusted on its own two points.
+    """
+    if len(hist) < 2:
+        return mu_pop
+    pts = hist[-4:]
+    n = len(pts)
+    ws = [MOM_DECAY ** (n - 1 - i) for i in range(n)]
+    sw = sum(ws)
+    mx = sum(w * p[0] for w, p in zip(ws, pts)) / sw
+    my = sum(w * p[1] for w, p in zip(ws, pts)) / sw
+    sxx = sum(w * (p[0] - mx) ** 2 for w, p in zip(ws, pts))
+    if sxx <= 1e-9:
+        return mu_pop
+    sxy = sum(w * (p[0] - mx) * (p[1] - my) for w, p in zip(ws, pts))
+    g = sxy / sxx
+    g = (g * sw + mu_pop * MOM_K) / (sw + MOM_K)
+    return max(MOM_FLOOR, min(MOM_CAP, g))
+
+
+def build_coins(marks, mu_pop):
+    """Latest known state of every coin the history names, plus momentum."""
+    t0 = parse_ts(marks[0]["at"])
+    hist = {}
+    latest = {}
     n = len(marks)
     for i, mark in enumerate(marks):
         at = parse_ts(mark["at"])
+        tmin = (at - t0).total_seconds() / 60.0
         for row in mark.get("rows") or []:
-            mint = row["mint"]
             cap = float(row["market_cap_lamports"]) / SOL_LAMPORTS
             if cap <= 0:
                 continue
-            age = (at - parse_ts(row["created_at"])).total_seconds() / 60.0
-            cur = coins.get(mint)
-            if cur is None:
-                coins[mint] = Coin(mint, math.log10(cap), age, row.get("venue"),
-                                   int(row.get("rank", 999)), i, False)
-            else:
-                if i >= cur.last_mark:
-                    cur.log = math.log10(cap)
-                    cur.age = age
-                    cur.venue = row.get("venue")
-                    cur.rank = int(row.get("rank", 999))
-                    cur.last_mark = i
-                    cur.stale = (i < n - 1)
+            mint = row["mint"]
+            log = math.log10(cap)
+            hist.setdefault(mint, []).append((tmin, log))
+            latest[mint] = (log, (at - parse_ts(row["created_at"])).total_seconds() / 60.0,
+                            row.get("venue"), int(row.get("rank", 999)), i, i < n - 1)
+    coins = {}
+    for mint in sorted(latest):
+        log, age, venue, rank, last_mark, stale = latest[mint]
+        coins[mint] = Coin(mint, log, age, venue, rank, last_mark, stale,
+                           coin_slope(hist[mint], mu_pop))
     return coins
 
 
 # --------------------------------------------------------------------------
 # data-driven parameters
 # --------------------------------------------------------------------------
-def estimate_params(marks, coins):
-    """Drift/spread of the leaders, the breakout rate and size, death rate."""
-    deltas = []
+def transitions(marks):
+    """(t_cur, span, prev_rows, cur_rows) for each mark pair."""
+    out = []
     for i in range(1, len(marks)):
         t_prev = parse_ts(marks[i - 1]["at"])
         t_cur = parse_ts(marks[i]["at"])
         span = (t_cur - t_prev).total_seconds() / 60.0
         if span <= 0:
             continue
-        prev = {}
-        for row in marks[i - 1].get("rows") or []:
-            cap = float(row["market_cap_lamports"]) / SOL_LAMPORTS
-            if cap > 0:
-                prev[row["mint"]] = math.log10(cap)
-        for row in marks[i].get("rows") or []:
-            mint = row["mint"]
-            if mint not in prev:
-                continue
-            cap = float(row["market_cap_lamports"]) / SOL_LAMPORTS
-            if cap <= 0:
-                continue
-            if prev[mint] < LEADER_LOG:
-                continue
-            deltas.append((math.log10(cap) - prev[mint]) * (10.0 / span))
-    if len(deltas) >= 4:
-        mu = sum(deltas) / len(deltas)
-        var = sum((d - mu) ** 2 for d in deltas) / len(deltas)
-        sd = math.sqrt(var)
-    else:
-        mu, sd = 0.085, 0.14
-    mu = max(0.0, min(0.35, mu))
-    sd = max(0.05, min(0.45, sd))
+        out.append((t_cur, span, marks[i - 1].get("rows") or [],
+                    marks[i].get("rows") or []))
+    return out
 
-    # breakout rate: distinct coins first seen at/above BREAK_LOG, per minute
-    seen = {}
+
+def estimate_params(marks):
+    """Leader growth and spread, fade rate, level growth, breakout rate/size."""
+    trs = transitions(marks)
+    t_last = parse_ts(marks[-1]["at"]) if marks else None
+
+    # --- leader growth: the coins that held a top-5 place across a transition
+    lead = []       # (delta per 10min, recency weight)
+    level = []      # place-1 cap growth per 10 min
+    persist = []    # (kept, total) of the previous mark's top 5, pool era only
+    for t_cur, span, prev_rows, cur_rows in trs:
+        age = 0.0 if t_last is None else max(0.0, (t_last - t_cur).total_seconds() / 600.0)
+        w = 0.62 ** age
+
+        def logs(rows):
+            out = {}
+            for row in rows:
+                cap = float(row["market_cap_lamports"]) / SOL_LAMPORTS
+                if cap > 0:
+                    out[row["mint"]] = math.log10(cap)
+            return out
+
+        plog = logs(prev_rows)
+        clog = logs(cur_rows)
+        for row in prev_rows[:5]:
+            mint = row["mint"]
+            if mint in clog and any(r["mint"] == mint for r in cur_rows[:5]):
+                lead.append(((clog[mint] - plog[mint]) * (10.0 / span), w))
+        if prev_rows and cur_rows:
+            level.append(((clog[cur_rows[0]["mint"]] - plog[prev_rows[0]["mint"]])
+                          * (10.0 / span), w))
+
+        def pool_era(rows):
+            if len(rows) < 5:
+                return False
+            for row in rows[:5]:
+                cap = float(row["market_cap_lamports"]) / SOL_LAMPORTS
+                if cap <= 0:
+                    return False
+                if row.get("venue") != "pool" and math.log10(cap) < BREAK_LOG:
+                    return False
+            return True
+
+        if pool_era(prev_rows) and pool_era(cur_rows):
+            top5 = {r["mint"] for r in prev_rows[:5]}
+            kept = sum(1 for r in cur_rows[:5] if r["mint"] in top5)
+            persist.append((kept, 5, w))
+
+    if lead:
+        mu = wmean(lead, 0.07)
+        sd = math.sqrt(max(0.0, wvar(lead, mu)))
+        sw = sum(w for _, w in lead)
+        mu = (mu * sw + 0.07 * 1.5) / (sw + 1.5)
+        sd = math.sqrt(max(0.0, (sd * sd * sw + 0.09 ** 2 * 1.5) / (sw + 1.5)))
+    else:
+        mu, sd = 0.07, 0.09
+    mu = max(0.0, min(0.15, mu))
+    sd = max(0.05, min(0.30, sd))
+
+    lvl_m = wmean(level, LEVEL_PRIOR)
+    lvl_sw = sum(w for _, w in level)
+    lvl = (lvl_m * lvl_sw + LEVEL_PRIOR * LEVEL_PRIOR_W) / (lvl_sw + LEVEL_PRIOR_W)
+    lvl = max(LEVEL_LO, min(LEVEL_HI, lvl))
+
+    if persist:
+        sw = sum(w for _, _, w in persist)
+        keep = sum(k * w for k, _, w in persist) / sw
+        tot = sum(t * w for _, t, w in persist) / sw
+        fade_m = 1.0 - keep / max(tot, 1e-9)
+        fade_m = (fade_m * sw + FADE_PRIOR * FADE_PRIOR_W) / (sw + FADE_PRIOR_W)
+    else:
+        fade_m = FADE_PRIOR
+    fade = max(FADE_LO, min(FADE_HI, fade_m))
+
+    # --- breakout rate ---
+    # first sighting at/above the contention level, per coin, recency weighted
+    seen_first = {}
     for i, mark in enumerate(marks):
         for row in mark.get("rows") or []:
             cap = float(row["market_cap_lamports"]) / SOL_LAMPORTS
             if cap <= 0:
                 continue
-            log = math.log10(cap)
-            if log < BREAK_LOG:
-                continue
             mint = row["mint"]
-            if mint not in seen or i < seen[mint][0]:
-                seen[mint] = (i, log)
-    first_mark = None
-    for mark in marks:
-        if mark.get("rows"):
-            first_mark = mark
-            break
-    if first_mark is not None and len(marks) >= 2:
-        t0 = parse_ts(first_mark["at"])
-        t1 = parse_ts(marks[-1]["at"])
-        cadence = 10.0
-        window = (t1 - t0).total_seconds() / 60.0 + cadence
+            log = math.log10(cap)
+            prev = seen_first.get(mint)
+            if prev is None:
+                seen_first[mint] = (i, log)
+            elif prev[1] < BREAK_LOG <= log:
+                seen_first[mint] = (i, log)
+    cross_w = 0.0
+    cross_sizes = []
+    for mint in sorted(seen_first):
+        i, log = seen_first[mint]
+        if log < BREAK_LOG:
+            continue
+        at = parse_ts(marks[i]["at"])
+        age = 0.0 if t_last is None else max(0.0, (t_last - at).total_seconds() / 600.0)
+        w = 0.55 ** age
+        cross_w += w
+        cross_sizes.append((log, w))
+    if t_last is not None and len(marks) >= 2:
+        span = (t_last - parse_ts(marks[0]["at"])).total_seconds() / 60.0 + 10.0
+        nbins = int(span / 10.0) + 1
+        tw = 10.0 * sum(0.55 ** b for b in range(nbins))
     else:
-        window = 0.0
-    sizes = [v[1] for v in seen.values()]
-    if window > 0 and sizes:
-        rate = len(sizes) / window
-        bmean = sum(sizes) / len(sizes)
-        bvar = sum((s - bmean) ** 2 for s in sizes) / len(sizes)
-        bsd = math.sqrt(bvar)
-    else:
-        rate, bmean, bsd = 0.0, 3.10, 0.20
-    rate = max(0.02, min(1.5, rate))
-    bsd = max(0.10, min(0.45, bsd))
+        tw = 0.0
+    rate_cross = cross_w / tw if tw > 0 else 0.0
 
-    # death rate of the leader cohort
-    alive = gone = 0
-    for i in range(len(marks) - 1):
-        cur = {}
-        for row in marks[i].get("rows") or []:
-            cap = float(row["market_cap_lamports"]) / SOL_LAMPORTS
-            if cap > 0 and math.log10(cap) >= LEADER_LOG:
-                cur[row["mint"]] = True
-        nxt = set()
-        for row in marks[i + 1].get("rows") or []:
-            nxt.add(row["mint"])
-        for mint in cur:
-            alive += 1
-            if mint not in nxt:
-                gone += 1
-    death = (gone / alive) if alive >= 8 else DEATH_LAMBDA
-    # never believe a leader is immortal, however clean the history looks
-    death = max(0.12, min(0.30, death))
+    # graduations counted by the recorder itself, recency weighted
+    grad_w = 0.0
+    grad_total = 0.0
+    prev_g = None
+    for i, mark in enumerate(marks):
+        g = (mark.get("counts") or {}).get("graduated")
+        if g is None:
+            continue
+        if prev_g is not None:
+            inc = g - prev_g
+            if inc > 0:
+                grad_total += inc
+                span = (parse_ts(marks[i]["at"]) - parse_ts(marks[i - 1]["at"])).total_seconds() / 60.0
+                if span > 0:
+                    at = parse_ts(marks[i]["at"])
+                    age = 0.0 if t_last is None else max(0.0, (t_last - at).total_seconds() / 600.0)
+                    grad_w += (inc * (10.0 / span)) * (0.62 ** age)
+        prev_g = g
+    # weighted mean of the per-10-minute increments, turned into per-minute
+    grad_rate = 0.0
+    if grad_total > 0:
+        sw = 0.0
+        prev_g = None
+        for i, mark in enumerate(marks):
+            g = (mark.get("counts") or {}).get("graduated")
+            if g is None:
+                continue
+            if prev_g is not None and g - prev_g > 0:
+                at = parse_ts(marks[i]["at"])
+                age = 0.0 if t_last is None else max(0.0, (t_last - at).total_seconds() / 600.0)
+                sw += 0.62 ** age
+            prev_g = g
+        grad_rate = (grad_w / sw / 10.0) if sw > 0 else 0.0
+    # the share of graduations that reach the contention level
+    ratio = 1.0 if grad_total <= 0 else max(0.30, min(1.0, len(cross_sizes) / grad_total))
+    rate_raw = rate_cross
+    if grad_rate > 0.0:
+        rate_raw = 0.5 * rate_cross + 0.5 * ratio * grad_rate
+
+    n_eff = tw / 10.0
+    rate = (rate_raw * n_eff + RATE_PRIOR * RATE_PRIOR_W) / (n_eff + RATE_PRIOR_W)
+    rate = max(RATE_LO, min(RATE_HI, rate))
+
+    if cross_sizes:
+        bmean = wmean(cross_sizes, BREAK_PRIOR[0])
+        bvar = wvar(cross_sizes, bmean)
+        sw = cross_w
+        bmean = (bmean * sw + BREAK_PRIOR[0] * BREAK_K) / (sw + BREAK_K)
+        bsd = math.sqrt(max(0.0, (bvar * sw + BREAK_PRIOR[1] ** 2 * BREAK_K) / (sw + BREAK_K)))
+    else:
+        bmean, bsd = BREAK_PRIOR
+    bsd = max(0.10, min(0.30, bsd))
+
+    # --- per-place size structure of the pool era (for the size calibration)
+    # only marks whose whole top 5 has graduated describe the sizes that
+    # matter; earlier marks still have curve coins in the lower places
+    era = []
+    for mark in marks[-3:]:
+        rows = mark.get("rows") or []
+        if len(rows) < 5:
+            continue
+        caps = []
+        ok = True
+        for row in rows[:5]:
+            c = float(row["market_cap_lamports"]) / SOL_LAMPORTS
+            if c <= 0:
+                ok = False
+                break
+            lg = math.log10(c)
+            if row.get("venue") != "pool" and lg < BREAK_LOG:
+                ok = False
+                break
+            caps.append(lg)
+        if ok:
+            era.append(caps)
+    if era:
+        gaps = []
+        sds = []
+        for k in range(5):
+            gs = [caps[0] - caps[k] for caps in era]
+            gaps.append(max(0.0, sum(gs) / len(gs)))
+            if len(era) >= 2:
+                m = sum(caps[k] for caps in era) / len(era)
+                sds.append(math.sqrt(sum((caps[k] - m) ** 2 for caps in era) / len(era)))
+            else:
+                sds.append(EMP_SD_PRIOR[k])
+    else:
+        gaps = list(GAP_PRIOR)
+        sds = list(EMP_SD_PRIOR)
 
     return {
         "mu": mu, "sd": sd, "rate": rate, "bmean": bmean, "bsd": bsd,
-        "death": death,
+        "fade": fade, "level": lvl, "gaps": gaps, "emp_sd": sds,
     }
 
 
 # --------------------------------------------------------------------------
 # the race
 # --------------------------------------------------------------------------
-def growth(horizon):
-    """Saturating drift and spread of a broken-out coin's log size."""
+def mom_drift(coin, params, horizon):
+    """Saturating cumulative growth from the coin's own momentum."""
     h = max(0.0, horizon)
-    drift = GROW_TOTAL * (1.0 - math.exp(-h / GROW_TAU))
-    return drift
+    return coin.slope * (h / 10.0) * sat_scale(h, MOM_TAU)
+
+
+def level_growth(params, horizon):
+    """Saturating cumulative growth of the place-1 cap level."""
+    h = max(0.0, horizon)
+    return min(LEVEL_CAP, params["level"] * (h / 10.0) * sat_scale(h, LEVEL_TAU))
 
 
 def coin_components(coin, params, horizon, cadence):
     """Mixture components (weight, mean, sd) of a named coin's future log size."""
     h = max(0.0, horizon)
     marks = h / cadence if cadence > 0 else h / 10.0
+    drift = mom_drift(coin, params, h)
+    sd = min(SIGMA_MAX, params["sd"] * math.sqrt(max(h, 0.0) / 10.0))
     # a coin that has already survived the early churn is the robust kind, so
     # the cumulative hazard grows sub-linearly in the number of marks
-    surv = math.exp(-(marks ** DEATH_BETA) * params["death"])
-    drift = growth(h)
-    sd = min(SIGMA_MAX, params["sd"] * math.sqrt(max(h, 0.0) / 10.0))
+    fade = 1.0 - math.exp(-((max(marks, 0.0) ** FADE_BETA)) * params["fade"])
+    stale_w = STALE_W if coin.stale else 1.0
     comps = []
-    if coin.log >= LEADER_LOG:
-        w = surv * (0.35 if coin.stale else 1.0)
-        comps.append((w, coin.log + drift, sd))
-        comps.append((1.0 - w, DUD_LOG, DUD_SD))
+    if coin.venue == "pool" or coin.log >= LEADER_LOG:
+        low_w = LOW_POOL_W if coin.log < LEADER_LOG else 1.0
+        stay = (1.0 - fade) * stale_w * low_w
+        fade_w = 1.0 - stay
+        comps.append((stay, coin.log + drift, sd))
+        comps.append((fade_w * (1.0 - FADE_DUD),
+                      max(DUD_LOG + 0.1, coin.log - FADE_DROP) + drift * 0.3,
+                      max(FADE_SD, sd * 0.8)))
+        comps.append((fade_w * FADE_DUD, DUD_LOG, DUD_SD))
     elif coin.log >= 1.9:
-        # still on its curve but with real traction: may graduate upward
-        jump_p = CURVE_JUMP_P * surv
-        comps.append((jump_p, params["bmean"] + drift * 0.6, max(0.18, sd * 0.7)))
-        keep = (1.0 - jump_p) * (0.45 if coin.stale else 1.0)
-        comps.append((keep, coin.log + drift * 0.5, sd))
-        comps.append((1.0 - jump_p - keep, DUD_LOG, DUD_SD))
+        # still on its curve: the graduation hazard grows with the distance
+        # to the completion level, and a graduation lands either at the
+        # breakout level or at a dead one
+        ramp = max(0.0, min(1.0, (coin.log - GRAD_LO) / (GRAD_HI - GRAD_LO)))
+        p1 = ramp * GRAD_P_MAX
+        p_grad = 1.0 - (1.0 - p1) ** max(marks, 0.0)
+        gw = p_grad * stale_w
+        comps.append((gw * 0.5, GRAD_HIT + drift * 0.6, max(GRAD_HIT_SD, sd * 0.7)))
+        comps.append((gw * 0.5, GRAD_MISS, 0.12))
+        keep = (1.0 - p_grad) * (1.0 - fade) * stale_w
+        comps.append((keep, coin.log + drift * 0.3, sd))
+        comps.append((1.0 - gw - keep, DUD_LOG, DUD_SD))
     else:
-        # dud: a small chance it is the next breakout
+        # dud: a small chance it is the next breakout, fading with its age
+        surv = (1.0 - fade) * math.exp(-max(0.0, coin.age) / 60.0)
         jump_p = 0.02 * surv
         comps.append((jump_p, params["bmean"] + drift * 0.6, max(0.20, sd)))
         comps.append((1.0 - jump_p, DUD_LOG, DUD_SD))
+    # keep the mixture proper
+    tot = sum(w for w, _, _ in comps)
+    if tot <= 0.0:
+        return [(1.0, coin.log, max(0.05, sd))]
+    if abs(tot - 1.0) > 1e-12:
+        comps = [(w / tot, m, s) for w, m, s in comps]
     return comps
 
 
@@ -312,16 +550,16 @@ def newcomer_intensity(params, horizon):
         # trapezoidal integral over age (minutes) of the survival function
         integ = 0.0
         for i, a in enumerate(ages):
-            drift = GROW_TOTAL * (1.0 - math.exp(-max(a - 2.0, 0.0) / GROW_TAU))
+            aa = max(a - 2.0, 0.0)
+            drift = params["mu"] * (aa / 10.0) * sat_scale(aa, MOM_TAU)
             sd = math.sqrt(params["bsd"] ** 2 +
-                           (min(SIGMA_MAX, params["sd"] * math.sqrt(max(a - 2.0, 0.0) / 10.0))) ** 2)
+                           (min(SIGMA_MAX, params["sd"] * math.sqrt(aa / 10.0))) ** 2)
             sf = norm_sf((x - (params["bmean"] + drift)) / sd)
-            # it also has to still be alive at the read, which bounds the
-            # population of old breakouts instead of letting it grow for ever.
-            # The newcomer pool is not pre-selected, so it faces the plain
-            # per-mark hazard; the coins the history names are the ones that
-            # already survived the early churn (see coin_components).
-            sf *= math.exp(-(a / 10.0) * params["death"])
+            # it also has to still be in the race at the read, which bounds
+            # the population of old breakouts instead of letting it grow for
+            # ever.  The newcomer pool is not pre-selected, so it faces the
+            # plain per-mark hazard.
+            sf *= math.exp(-(a / 10.0) * params["fade"])
             lo = 0.0 if i == 0 else (ages[i - 1] + a) / 2.0
             hi = h if i == len(ages) - 1 else (a + ages[i + 1]) / 2.0
             integ += sf * max(0.0, hi - lo)
@@ -332,8 +570,7 @@ def newcomer_intensity(params, horizon):
 def race(named, params, horizon, places, chart_size, cadence, edges):
     """Per-place named-coin probabilities, newcomer mass and size bins."""
     # keep the plausible candidates only: leaders plus recent movers
-    named.sort(key=lambda c: (-c.log, c.rank))
-    named = named[:400]
+    named = sorted(named, key=lambda c: (-c.log, c.rank, c.mint))[:400]
     comps = {}
     for c in named:
         comps[c.mint] = coin_components(c, params, horizon, cadence)
@@ -442,6 +679,23 @@ def race(named, params, horizon, places, chart_size, cadence, edges):
 # --------------------------------------------------------------------------
 # forecast assembly
 # --------------------------------------------------------------------------
+def emp_size_bins(params, anchor, places, edges):
+    """Measured per-place size distribution: gaps around the anchor level."""
+    nbins = len(edges) + 1
+    out = []
+    for k in range(places):
+        mean = anchor - params["gaps"][k]
+        sd = max(EMP_SD_FLOOR, params["emp_sd"][k])
+        row = []
+        for b in range(nbins):
+            lo = edges[b - 1] if b >= 1 else -1e9
+            hi = edges[b] if b < nbins - 1 else 1e9
+            p = norm_cdf((hi - mean) / sd) - norm_cdf((lo - mean) / sd)
+            row.append(max(0.0, p))
+        out.append(row)
+    return out
+
+
 def build_forecast(task, marks):
     places = int(task.get("places", 5))
     chart_size = int(task.get("chart_size", 100))
@@ -450,17 +704,40 @@ def build_forecast(task, marks):
     reads = [parse_ts(r) for r in task.get("reads", [])]
     if not reads:
         reads = [parse_ts(task["window"]["answer_at"])]
-    coins = build_coins(marks)
-    params = estimate_params(marks, coins)
+    params = estimate_params(marks)
+    coins = build_coins(marks, params["mu"])
     last_at = parse_ts(marks[-1]["at"]) if marks else parse_ts(task["t0"])
+    nbins = len(edges) + 1
 
     # only the plausible candidates are worth naming
-    cand = sorted(coins.values(), key=lambda c: (-c.log, c.rank))
+    cand = sorted(coins.values(), key=lambda c: (-c.log, c.rank, c.mint))
     cand = [c for c in cand if c.log >= 1.9 or c.venue == "pool"][:400]
+
+    # anchor of the measured size distribution: the last mark's leader cap,
+    # when the pool era has begun; otherwise the race's own place-1 mean
+    last_rows = marks[-1].get("rows") or [] if marks else []
+    anchor_emp = None
+    if len(last_rows) >= 5:
+        cap1 = float(last_rows[0]["market_cap_lamports"]) / SOL_LAMPORTS
+        if cap1 > 0:
+            lg1 = math.log10(cap1)
+            if last_rows[0].get("venue") == "pool" or lg1 >= BREAK_LOG:
+                anchor_emp = lg1
+
+    # log-cap centre of every size bin (for reading a distribution's level)
+    centers = []
+    for b in range(nbins):
+        if b == 0:
+            centers.append(edges[0] - 0.05)
+        elif b == nbins - 1:
+            centers.append(edges[-1] + 0.05)
+        else:
+            centers.append((edges[b - 1] + edges[b]) / 2.0)
 
     acc_coin = [dict() for _ in range(places)]
     acc_new = [0.0] * places
-    acc_bins = [[0.0] * (len(edges) + 1) for _ in range(places)]
+    acc_bins = [[0.0] * nbins for _ in range(places)]
+    acc_emp = [[0.0] * nbins for _ in range(places)]
     nreads = 0
     for r in reads:
         horizon = (r - last_at).total_seconds() / 60.0
@@ -474,6 +751,20 @@ def build_forecast(task, marks):
             acc_new[k] += pn[k]
             for b, v in enumerate(pb[k]):
                 acc_bins[k][b] += v
+        # anchor of the measured distribution: the last mark's leader cap
+        # grown at the measured level, blended with the race's own place-1
+        # mean (the race knows about newcomers the anchor does not)
+        tot = sum(pb[0])
+        model_p1 = (sum(c * pb[0][b] for b, c in enumerate(centers)) / tot) if tot > 0 else 0.0
+        if anchor_emp is not None:
+            anchor = (ANCHOR_W * (anchor_emp + level_growth(params, horizon)) +
+                      (1.0 - ANCHOR_W) * model_p1)
+        else:
+            anchor = model_p1
+        emp = emp_size_bins(params, anchor, places, edges)
+        for k in range(places):
+            for b, v in enumerate(emp[k]):
+                acc_emp[k][b] += v
     inv = 1.0 / max(1, nreads)
     for k in range(places):
         for m in list(acc_coin[k].keys()):
@@ -487,10 +778,11 @@ def build_forecast(task, marks):
         for mint, p in rows:
             probabilities.append({"mint": mint, "place": k + 1, "p": round(p, 9)})
 
-    # ---- sizes ----
+    # ---- sizes: the race's bins blended with the measured distribution ----
     sizes = []
     for k in range(places):
-        bins = [v * inv for v in acc_bins[k]]
+        bins = [(1.0 - W_EMP) * acc_bins[k][b] * inv +
+                W_EMP * acc_emp[k][b] * inv for b in range(nbins)]
         tot = sum(bins)
         if tot > 1.0:
             bins = [b / tot for b in bins]
